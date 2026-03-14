@@ -1,0 +1,74 @@
+# ═══════════════════════════════════════════════════════════
+# Render Deployment Config — Liquidity-Sweep Paper Scout
+#
+# Service type: web (Free Web Service)
+# Python: 3.11.9 — explicitly pinned.
+#   Render's default is Python 3.14 which has no pre-built
+#   wheels for scipy/numpy. Also set .python-version in repo.
+#
+# DEPLOYMENT STEPS:
+#   1. Push all files to your GitHub repo
+#   2. Go to Render dashboard → New → Blueprint
+#   3. Point to this render_liquidity.yaml
+#   4. Set the env vars listed below in Render Environment tab:
+#        DATABASE_URL        → auto-injected from liquidity-scout-db
+#        SCRAPER_API_KEY     → same key used by causal scout
+#        BREEZE_API_KEY      → ICICI Direct API key
+#        BREEZE_SECRET       → ICICI Direct secret
+#        BREEZE_SESSION_TOKEN → refresh daily in Render dashboard
+#   5. Deploy — health server binds port within 5 seconds
+#   6. Set up UptimeRobot → ping https://<your-service>.onrender.com/health
+#      every 5 minutes to prevent Render free tier spin-down
+#
+# MONITORING:
+#   Logs stream to Render dashboard → your service → Logs tab
+#   Performance printed every 3 cycles (~2.75 hours)
+#   Signals stored permanently in liquidity-scout-db
+# ═══════════════════════════════════════════════════════════
+
+services:
+  - type: web
+    name: liquidity-paper-scout
+    runtime: python
+    repo: https://github.com/YOUR_ORG/YOUR_REPO   # ← update this
+    branch: main
+    pythonVersion: "3.11.9"
+    buildCommand: pip install -r requirements_liquidity_render.txt
+    startCommand: python liquidity_paper_scout.py
+    plan: free
+    envVars:
+      # ── Database ───────────────────────────────────────────
+      - key: DATABASE_URL
+        fromDatabase:
+          name: liquidity-scout-db
+          property: connectionString
+
+      # ── Brain selection ────────────────────────────────────
+      - key: LIQUIDITY_SCOUT_INTERVAL_MIN
+        value: "55"            # 55 min = fires once per H1 candle close
+
+      # ── Data sources ───────────────────────────────────────
+      - key: SCRAPER_API_KEY
+        sync: false            # set manually in Render → Environment
+      - key: SCRAPER_DAILY_LIMIT
+        value: "900"           # conservative limit — shared with causal scout
+
+      # ── Breeze (Indian stocks) ─────────────────────────────
+      # These 3 must be refreshed manually every day
+      # BREEZE_SESSION_TOKEN expires at midnight IST
+      - key: BREEZE_API_KEY
+        sync: false
+      - key: BREEZE_SECRET
+        sync: false
+      - key: BREEZE_SESSION_TOKEN
+        sync: false            # ← refresh daily in Render dashboard
+
+      # ── Optional tuning ────────────────────────────────────
+      - key: ACCURACY_STATS_LAST_N
+        value: "50"
+
+databases:
+  - name: liquidity-scout-db
+    databaseName: liquidity_scout
+    plan: free
+    postgresMajorVersion: 16

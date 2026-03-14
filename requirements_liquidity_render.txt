@@ -1,0 +1,42 @@
+# ═══════════════════════════════════════════════════════════
+# Liquidity-Sweep Paper Scout — Python Dependencies
+#
+# TARGET: Python 3.11.9
+# Set PYTHON_VERSION=3.11.9 in Render dashboard Environment tab.
+# Also add a .python-version file to repo root containing: 3.11.9
+#
+# DESIGN: Keep it light. No torch. No heavy ML.
+# Estimated RAM: ~200 MB (slightly more than causal due to regime_ensemble)
+#
+# DIFFERENCES vs causal scout requirements:
+#   + pandas ≥2.2 (same)
+#   + scikit-learn: needed by regime_ensemble if it uses ML classifiers
+#   + numpy: needed by liquidity_sweep brain (ATR/RSI vectorised)
+#   - No scipy (regime_ensemble uses simpler statistics)
+# ═══════════════════════════════════════════════════════════
+
+# ── Data & Math ─────────────────────────────────────────────
+pandas==2.2.2
+numpy==1.26.4
+yfinance==0.2.40
+
+# ── ML (regime_ensemble may use lightweight classifiers) ────
+scikit-learn==1.4.2
+
+# ── Breeze (ICICI Direct) — Indian stocks ───────────────────
+breeze-connect==1.0.65
+
+# ── Database ────────────────────────────────────────────────
+sqlalchemy==2.0.31
+psycopg2-binary==2.9.9
+pgvector==0.3.2
+
+# ── Logging ─────────────────────────────────────────────────
+structlog==24.2.0
+
+# ── Environment ─────────────────────────────────────────────
+python-dotenv==1.0.1
+
+# ── HTTP / Network ───────────────────────────────────────────
+requests==2.32.3
+urllib3==2.2.2
