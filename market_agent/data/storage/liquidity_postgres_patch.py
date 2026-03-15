@@ -336,12 +336,12 @@ def _get_liquidity_performance(self, brain_name: str = "Liquidity-Sweep") -> Opt
 # ═══════════════════════════════════════════════════════════════
 
 try:
-    from market_agent.data.storage.postgres import PostgresStorage, Base as _Base
+    from market_agent.data.storage.postgres import PostgresStorage
 
-    # Register the table with the shared metadata so create_all() picks it up
-    LiquidityPaperSignal.__table__.tometadata(_Base.metadata, replace=True)
-
-    # Attach methods
+    # Attach the 3 liquidity methods onto PostgresStorage.
+    # No tometadata() call needed — LiquidityPaperSignal uses the same Base
+    # as postgres.py so Base.metadata.create_all() picks it up automatically.
+    # tometadata() was removed in SQLAlchemy 2.0 — do NOT use it.
     PostgresStorage.store_liquidity_signal      = _store_liquidity_signal
     PostgresStorage.resolve_liquidity_signals   = _resolve_liquidity_signals
     PostgresStorage.get_liquidity_performance   = _get_liquidity_performance

@@ -419,10 +419,20 @@ class PostgresStorage:
         self.engine = create_engine(connection_string)
         self.Session = sessionmaker(bind=self.engine)
 
-        # Enable pgvector extension
-        with self.engine.connect() as conn:
-            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-            conn.commit()
+        # Enable pgvector extension — requires superuser on some DBs.
+        # Wrapped in try/except so it degrades gracefully on Render free tier
+        # where the DB user does not have superuser privileges.
+        # If pgvector is unavailable, vector columns simply won't work,
+        # but all other tables (including liquidity_paper_signals) are unaffected.
+        try:
+            with self.engine.connect() as conn:
+                conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+                conn.commit()
+        except Exception as _pgvec_err:
+            import logging as _log
+            _log.getLogger("postgres").warning(
+                f"pgvector extension not available (non-fatal): {_pgvec_err}"
+            )
 
         Base.metadata.create_all(self.engine)
         # logger.info("database_initialized") # Silenced to prevent Windows OSError [Errno 22]
@@ -491,7 +501,7 @@ class PostgresStorage:
         finally:
             session.close()
 
-    def get_latest_data(self, symbol, timeframe, limit=100):
+    def get_latest_data(self, symbol, timeframe, limit=1000):
         """
         Step 2.3 COLUMNAR-READ-FIRST shim.
         Reads from new numeric columns when available (close_price is not NULL).
