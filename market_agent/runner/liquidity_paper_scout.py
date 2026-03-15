@@ -662,9 +662,11 @@ def start_scout():
 
     # ── Step 1: DB connection ─────────────────────────────────────
     try:
-        # Import patch FIRST — registers LiquidityPaperSignal and patches methods
+        print("  Importing liquidity_postgres_patch...")
         import market_agent.data.storage.liquidity_postgres_patch  # noqa
+        print("  Importing PostgresStorage from postgres...")
         from market_agent.data.storage.postgres import PostgresStorage
+        print("  Connecting to database...")
         storage = PostgresStorage()
         # Ensure liquidity_paper_signals table exists
         from market_agent.data.storage.liquidity_postgres_patch import (
@@ -673,7 +675,10 @@ def start_scout():
         Base.metadata.create_all(storage.engine)
         print("  ✅ Database connected. liquidity_paper_signals table ready.")
     except Exception as e:
+        import traceback
         print(f"  ❌ FATAL — Cannot connect to database: {e}")
+        print("  Full traceback:")
+        traceback.print_exc()
         print("     Ensure DATABASE_URL environment variable is set.")
         sys.exit(1)
 
@@ -683,7 +688,9 @@ def start_scout():
         brain_fn = liquidity_sweep_signal
         print("  ✅ Brain loaded: Liquidity-Sweep v5 (vol=1.5 dist=0.3 piv=2 age=5)")
     except Exception as e:
+        import traceback
         print(f"  ❌ FATAL — Cannot load brain: {e}")
+        traceback.print_exc()
         sys.exit(1)
 
     # ── Step 3: Load regime brain (degrades gracefully) ───────────
