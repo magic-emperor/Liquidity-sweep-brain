@@ -338,13 +338,18 @@ def _get_liquidity_performance(self, brain_name: str = "Liquidity-Sweep") -> Opt
 try:
     from market_agent.data.storage.postgres import PostgresStorage
 
-    # Attach the 3 liquidity methods onto PostgresStorage.
-    # No tometadata() call needed — LiquidityPaperSignal uses the same Base
-    # as postgres.py so Base.metadata.create_all() picks it up automatically.
-    # tometadata() was removed in SQLAlchemy 2.0 — do NOT use it.
+    # Attach methods
     PostgresStorage.store_liquidity_signal      = _store_liquidity_signal
     PostgresStorage.resolve_liquidity_signals   = _resolve_liquidity_signals
     PostgresStorage.get_liquidity_performance   = _get_liquidity_performance
+
+    # NOTE: No tometadata() call needed.
+    # LiquidityPaperSignal is declared using the same Base as postgres.py.
+    # SQLAlchemy 2.0: Base.metadata.create_all() automatically includes ALL
+    # models registered to that Base, including LiquidityPaperSignal.
+    # The scout calls Base.metadata.create_all(storage.engine) explicitly
+    # after importing this patch, which creates the table correctly.
+    # tometadata() was removed in SQLAlchemy 2.0 — do not use it.
 
     log.info("liquidity_postgres_patch: methods patched onto PostgresStorage ✓")
 
