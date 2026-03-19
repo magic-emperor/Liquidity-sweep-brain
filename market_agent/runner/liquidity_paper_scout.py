@@ -132,6 +132,11 @@ def _is_market_open(symbol: str) -> bool:
 _cache: Dict[str, Dict] = {}
 _CACHE_TTL_MIN = 50
 
+# Tracks symbols where ALL data tiers failed so we don't hammer them
+# every cycle.  Cleared after _FAILURE_CACHE_TTL_MIN minutes.
+_failure_cache: Dict[str, datetime] = {}
+_FAILURE_CACHE_TTL_MIN = 20
+
 
 def _scraper_quota_ok() -> bool:
     global _scraper_calls, _scraper_reset_date
@@ -288,37 +293,206 @@ def _fetch_breeze(symbol: str) -> Optional[pd.DataFrame]:
 
 
 def _fetch_yfinance_plain(symbol: str) -> Optional[pd.DataFrame]:
-    """Plain yfinance — fallback tier, works locally, may be blocked on Render cloud IPs."""
+    """
+    Plain yfinance — fallback tier.
+
+    Known failure mode on cloud IPs (Render, Railway, etc.):
+      yf.Ticker.history() calls Yahoo Finance directly without a proxy.
+      Yahoo rate-limits / blocks cloud IPs and returns an empty HTTP body.
+      yfinance silently catches the JSONDecodeError and returns an empty
+      DataFrame (or raises 'No price data found / possibly delisted').
+      This is NOT a delisting — it is an IP block.
+
+    Fixes applied here:
+      1. tz_convert(None) instead of tz_localize(None) — tz_localize raises
+         TypeError on already-tz-aware DatetimeIndex (pandas ≥ 1.5).
+      2. Explicit bar-count log so the caller can see WHY None was returned.
+      3. Session-level User-Agent spoof via yf.set_tz_cache_location is not
+         enough — we pass a requests Session with browser headers so Yahoo
+         is less likely to block the initial metadata call.
+    """
+    import warnings
+
+    # ── attempt 1: yfinance with a spoofed session ───────────────────────
     try:
-        df = yf.Ticker(symbol).history(period=DATA_PERIOD, interval=DATA_INTERVAL)
-        if df is None or df.empty:
-            return None
-        if df.index.tz is not None:
-            df.index = df.index.tz_localize(None)
-        df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-        df.dropna(inplace=True)
-        return df if len(df) >= 100 else None
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate, br",
+        })
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            ticker = yf.Ticker(symbol, session=session)
+            df     = ticker.history(period=DATA_PERIOD, interval=DATA_INTERVAL)
+
+        if df is not None and not df.empty:
+            # FIX: tz_convert(None) strips tz info from aware index;
+            #      tz_localize(None) throws TypeError if tz is already set.
+            if df.index.tz is not None:
+                df.index = df.index.tz_convert(None)
+            df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+            df.dropna(inplace=True)
+            if len(df) >= 100:
+                logger.debug("yf_plain_ok", symbol=symbol, bars=len(df), attempt=1)
+                return df
+            else:
+                logger.warning(
+                    "yf_plain_too_few_bars",
+                    symbol=symbol, bars=len(df), needed=100,
+                    hint="Yahoo may be returning partial data for this IP",
+                )
+                # fall through to attempt 2
+        else:
+            logger.warning(
+                "yf_plain_empty",
+                symbol=symbol,
+                hint="Yahoo returned no data — likely IP block on cloud host. "
+                     "ScraperAPI quota exhausted. Consider upgrading ScraperAPI "
+                     "plan or adding a secondary proxy.",
+            )
+            # fall through to attempt 2
+
     except Exception as e:
-        logger.debug("yf_plain_failed", symbol=symbol, error=str(e)[:80])
+        logger.warning("yf_plain_attempt1_error", symbol=symbol, error=str(e)[:120])
+        # fall through to attempt 2
+
+    # ── attempt 2: raw Yahoo Finance v8 API via requests (no proxy) ──────
+    # Sometimes the yfinance metadata/crumb fetch fails but a direct
+    # v8 chart call succeeds from the same IP.
+    try:
+        _PERIOD_MAP = {"90d": "3mo", "60d": "2mo", "30d": "1mo"}
+        yf_range = _PERIOD_MAP.get(DATA_PERIOD, "3mo")
+        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
+
+        resp = requests.get(
+            url,
+            params={"interval": DATA_INTERVAL, "range": yf_range},
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/123.0.0.0 Safari/537.36"
+                ),
+                "Accept": "application/json",
+                "Referer": "https://finance.yahoo.com/",
+            },
+            timeout=20,
+        )
+
+        if resp.status_code != 200:
+            logger.warning(
+                "yf_plain_attempt2_http_error",
+                symbol=symbol, status=resp.status_code,
+                hint="Yahoo blocking this IP — ScraperAPI is the only reliable fix",
+            )
+            return None
+
+        data   = resp.json()
+        result = data.get("chart", {}).get("result")
+        if not result:
+            err_msg = data.get("chart", {}).get("error", {})
+            logger.warning(
+                "yf_plain_attempt2_no_result",
+                symbol=symbol, yahoo_error=str(err_msg)[:120],
+            )
+            return None
+
+        result     = result[0]
+        timestamps = result.get("timestamp", [])
+        ohlcv      = result.get("indicators", {}).get("quote", [{}])[0]
+
+        if not timestamps or not ohlcv.get("close"):
+            logger.warning("yf_plain_attempt2_empty_ohlcv", symbol=symbol)
+            return None
+
+        df = pd.DataFrame({
+            "Open":   ohlcv.get("open",   [None] * len(timestamps)),
+            "High":   ohlcv.get("high",   [None] * len(timestamps)),
+            "Low":    ohlcv.get("low",    [None] * len(timestamps)),
+            "Close":  ohlcv.get("close",  [None] * len(timestamps)),
+            "Volume": ohlcv.get("volume", [0]    * len(timestamps)),
+        }, index=pd.to_datetime(timestamps, unit="s"))
+        df.dropna(inplace=True)
+
+        if len(df) < 100:
+            logger.warning(
+                "yf_plain_attempt2_too_few_bars",
+                symbol=symbol, bars=len(df),
+            )
+            return None
+
+        logger.debug("yf_plain_ok", symbol=symbol, bars=len(df), attempt=2)
+        return df
+
+    except Exception as e:
+        logger.warning("yf_plain_attempt2_error", symbol=symbol, error=str(e)[:120])
         return None
 
 
 def _fetch_ohlcv(symbol: str) -> Optional[pd.DataFrame]:
     """
-    3-tier data waterfall. Result is cached for 50 min.
+    3-tier data waterfall. Successful result cached for 50 min.
+    Failed symbols cached for 20 min to avoid hammering all tiers every cycle.
+
     Indian: Breeze (T1) → ScraperAPI (T2) → yfinance (T3)
     US:     ScraperAPI (T1) → yfinance (T2)
+
+    Common failure: ScraperAPI quota exhausted + Yahoo blocks cloud IPs
+    → yfinance fallback also fails → symbol skipped for 20 min.
+    Fix: top up ScraperAPI quota, or add a secondary proxy.
     """
+    now = datetime.now()
+
+    # ── success cache ────────────────────────────────────────────────────
     hit = _cache.get(symbol)
     if hit:
-        age_min = (datetime.now() - hit["fetched_at"]).total_seconds() / 60
+        age_min = (now - hit["fetched_at"]).total_seconds() / 60
         if age_min < _CACHE_TTL_MIN:
             return hit["df"]
 
+    # ── failure cache — don't retry a dead symbol every 55 min cycle ────
+    failed_at = _failure_cache.get(symbol)
+    if failed_at:
+        age_min = (now - failed_at).total_seconds() / 60
+        if age_min < _FAILURE_CACHE_TTL_MIN:
+            logger.debug(
+                "data_skip_failure_cached",
+                symbol=symbol,
+                retry_in_min=round(_FAILURE_CACHE_TTL_MIN - age_min, 1),
+            )
+            return None
+        else:
+            del _failure_cache[symbol]   # TTL expired — try again
+
     def _store(df, tier):
-        logger.debug("data_ok", symbol=symbol, tier=tier, bars=len(df))
-        _cache[symbol] = {"df": df, "fetched_at": datetime.now()}
+        logger.info("data_ok", symbol=symbol, tier=tier, bars=len(df))
+        _cache[symbol] = {"df": df, "fetched_at": now}
         return df
+
+    def _all_failed():
+        scraper_key_set  = bool(os.getenv("SCRAPER_API_KEY", ""))
+        scraper_quota_ok = _scraper_quota_ok()
+        logger.warning(
+            "data_all_tiers_failed",
+            symbol=symbol,
+            scraper_key_set=scraper_key_set,
+            scraper_quota_ok=scraper_quota_ok,
+            hint=(
+                "ScraperAPI quota exhausted — yfinance fallback also blocked by Yahoo "
+                "on this cloud IP. Top up ScraperAPI quota to restore data for this symbol."
+                if scraper_key_set and not scraper_quota_ok
+                else "All data sources failed — check SCRAPER_API_KEY env var and network."
+            ),
+        )
+        _failure_cache[symbol] = now
+        return None
 
     is_indian = ".NS" in symbol or ".BO" in symbol
 
@@ -340,8 +514,7 @@ def _fetch_ohlcv(symbol: str) -> Optional[pd.DataFrame]:
         if df is not None:
             return _store(df, "T2-yf-plain")
 
-    logger.warning("data_all_tiers_failed", symbol=symbol)
-    return None
+    return _all_failed()
 
 
 def _get_current_price(symbol: str, fallback_df: pd.DataFrame) -> float:
